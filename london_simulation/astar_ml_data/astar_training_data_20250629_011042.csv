@@ -1,2 +1,0 @@
-source_x,source_y,dest_x,dest_y,straight_distance,vehicle_count,hour,is_rush_hour,is_weekend,avg_network_congestion,scenario,scenario_normal,path_length,travel_time,total_distance,avg_congestion,computation_time
--0.0921984,51.5127289,-0.0990607,51.5195968,0.009708718334571419,0,14,0,0,1.9581666021783837,Normal,1,140,305.10044410574795,1551.28355382144,1.9581666021783837,0.005421161651611328
