@@ -1,0 +1,22 @@
+{
+  "scenario": "Normal",
+  "timestamp": "2025-06-24 07:41:29",
+  "network_stats": {
+    "total_nodes": 2029,
+    "total_edges": 2137,
+    "avg_congestion": 2.523228917585522,
+    "max_congestion": 4.737738584040865,
+    "congestion_variance": 0.8021891793660665,
+    "total_vehicles": 1
+  },
+  "algorithm_analysis": {
+    "vehicles_analyzed": 0,
+    "algorithm_performance": {},
+    "gnn_improvements": [],
+    "recommendations_accuracy": 0.0
+  },
+  "ml_predictions": {},
+  "recommendations": [
+    "Advanced ML features not available. Consider training GNN models for better performance."
+  ]
+}
