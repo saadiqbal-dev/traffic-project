@@ -1,6 +1,7 @@
 """
 Routing algorithms for the traffic simulation project.
 Includes A*, Shortest Path, and Shortest Path Congestion Aware algorithms.
+Updated to use unified travel time calculation system for realistic and consistent results.
 """
 
 import heapq
@@ -10,11 +11,13 @@ import numpy as np
 from typing import Tuple, Optional, List, Dict
 
 from models import Vehicle, get_edge_travel_time, get_base_travel_time
+from unified_travel_time import UnifiedTravelTimeCalculator, TravelTimeValidator
 
 
 def enhanced_a_star_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Optional[List[int]], float, float]:
     """
-    Enhanced A* algorithm using direct distance as heuristic and better congestion handling.
+    Enhanced A* algorithm that finds optimal path with priority: Congestion > Travel Time > Distance.
+    This algorithm considers congestion as the primary factor, then travel time, then distance.
     
     Args:
         G: NetworkX graph with congestion data
@@ -25,6 +28,7 @@ def enhanced_a_star_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Option
         Tuple of (path, travel_time, computation_time)
     """
     start_time = time.time()
+    calc = UnifiedTravelTimeCalculator()
     
     # Get node positions for heuristic
     pos = {}
@@ -34,31 +38,48 @@ def enhanced_a_star_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Option
         else:
             pos[node] = (0, 0)
     
-    # Define heuristic function (Euclidean distance)
-    def heuristic(n1: int, n2: int) -> float:
+    # Define multi-criteria heuristic function
+    def multi_criteria_heuristic(n1: int, n2: int) -> Tuple[float, float, float]:
+        """
+        Returns (congestion_penalty, travel_time_estimate, distance_estimate)
+        Priority: Congestion > Travel Time > Distance
+        """
+        # Distance estimate (Euclidean)
         if n1 in pos and n2 in pos:
             x1, y1 = pos[n1]
             x2, y2 = pos[n2]
-            return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+            distance_estimate = ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
         else:
-            return 0
+            distance_estimate = 0
+        
+        # Estimate travel time based on average speed (rough heuristic)
+        avg_speed_ms = 50 / 3.6  # 50 km/h in m/s
+        travel_time_estimate = distance_estimate / avg_speed_ms if avg_speed_ms > 0 else 0
+        
+        # Congestion penalty estimate (assume moderate congestion for heuristic)
+        congestion_penalty = 2.0  # Moderate congestion assumption
+        
+        return (congestion_penalty, travel_time_estimate, distance_estimate)
     
-    # Initialize data structures
-    g_score = {node: float('infinity') for node in G.nodes()}
-    g_score[start] = 0
+    # Initialize data structures with multi-criteria costs
+    # g_score stores (congestion_cost, travel_time_cost, distance_cost)
+    g_score = {node: (float('infinity'), float('infinity'), float('infinity')) for node in G.nodes()}
+    g_score[start] = (0, 0, 0)
     
-    f_score = {node: float('infinity') for node in G.nodes()}
-    f_score[start] = heuristic(start, end)
+    # f_score combines g_score and heuristic
+    f_score = {node: (float('infinity'), float('infinity'), float('infinity')) for node in G.nodes()}
+    heuristic_start = multi_criteria_heuristic(start, end)
+    f_score[start] = heuristic_start
     
     # Track previous nodes for path reconstruction
     previous = {node: None for node in G.nodes()}
     
-    # Priority queue for nodes to visit (f_score, node)
+    # Priority queue for nodes to visit - use tuple comparison for multi-criteria
     open_set = [(f_score[start], start)]
     closed_set = set()
     
     while open_set:
-        # Get node with smallest f_score
+        # Get node with best multi-criteria score
         _, current_node = heapq.heappop(open_set)
         
         # If we've reached the end, we're done
@@ -75,40 +96,65 @@ def enhanced_a_star_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Option
         for neighbor in G.neighbors(current_node):
             if neighbor in closed_set:
                 continue
-                
-            # Calculate BASE travel time (no congestion)
-            travel_time = get_base_travel_time(G, current_node, neighbor)
-            # Get congestion from first edge key (multigraph support)
-            congestion = 1.0
+            
+            # Calculate edge costs with priority: Congestion > Travel Time > Distance
+            edge_congestion_cost = 0
+            edge_travel_time = 0
+            edge_distance = 0
+            
             if current_node in G and neighbor in G[current_node]:
                 edge_keys = list(G[current_node][neighbor].keys())
                 if edge_keys:
-                    edge_data = G[current_node][neighbor][edge_keys[0]]
-                    if isinstance(edge_data, dict):
-                        congestion = edge_data.get('congestion', 1.0)
-            
-            # Apply REALISTIC London congestion penalties
-            if congestion > 4.0:
-                penalty = travel_time * 3.5  # Heavy traffic: 71% speed reduction (stop-and-go traffic)
-            elif congestion > 3.0:
-                penalty = travel_time * 2.2  # Moderate traffic: 55% speed reduction (heavy congestion)
-            elif congestion > 2.0:
-                penalty = travel_time * 1.5  # Light traffic: 33% speed reduction (slow traffic)
+                    k = edge_keys[0]  # Use first edge key
+                    edge_data = G[current_node][neighbor][k]
+                    
+                    # Get congestion level (primary factor)
+                    congestion_level = edge_data.get('congestion', 1.0)
+                    edge_congestion_cost = congestion_level
+                    
+                    # Get travel time (secondary factor)
+                    try:
+                        edge_travel_time = calc.calculate_edge_travel_time(
+                            G, current_node, neighbor, k, apply_congestion=True
+                        )
+                    except (KeyError, ValueError):
+                        edge_travel_time = 60.0
+                    
+                    # Get distance (tertiary factor)
+                    edge_distance = edge_data.get('length', 100)
+                else:
+                    edge_congestion_cost = 5.0  # High penalty for missing data
+                    edge_travel_time = 60.0
+                    edge_distance = 100
             else:
-                penalty = travel_time        # Free flow
+                edge_congestion_cost = 5.0  # High penalty for missing edge
+                edge_travel_time = 60.0
+                edge_distance = 100
             
-            # Calculate new g_score
-            tentative_g_score = g_score[current_node] + penalty
+            # Calculate new g_score (cumulative costs)
+            current_g = g_score[current_node]
+            tentative_g_score = (
+                current_g[0] + edge_congestion_cost,      # Congestion (primary)
+                current_g[1] + edge_travel_time,          # Travel time (secondary)
+                current_g[2] + edge_distance              # Distance (tertiary)
+            )
             
-            # Update if this is a better path
+            # Update if this is a better path (lexicographic comparison)
             if tentative_g_score < g_score[neighbor]:
                 previous[neighbor] = current_node
                 g_score[neighbor] = tentative_g_score
-                f_score[neighbor] = g_score[neighbor] + heuristic(neighbor, end)
+                
+                # Calculate f_score with heuristic
+                heuristic_neighbor = multi_criteria_heuristic(neighbor, end)
+                f_score[neighbor] = (
+                    tentative_g_score[0] + heuristic_neighbor[0],
+                    tentative_g_score[1] + heuristic_neighbor[1],
+                    tentative_g_score[2] + heuristic_neighbor[2]
+                )
                 heapq.heappush(open_set, (f_score[neighbor], neighbor))
     
     # Reconstruct path
-    if g_score[end] == float('infinity'):
+    if g_score[end][0] == float('infinity'):
         print(f"No path found from {start} to {end} using Enhanced A* algorithm")
         return None, float('inf'), 0
     
@@ -119,19 +165,19 @@ def enhanced_a_star_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Option
         current = previous[current]
     path.reverse()
     
-    # Return the g_score as travel time since congestion was already applied during pathfinding
-    # This avoids the DOUBLE PENALTY problem where congestion gets applied twice
-    path_length = g_score[end]
+    # Calculate final travel time using unified system
+    final_travel_time = calc.calculate_path_travel_time(G, path, apply_congestion=True)
     
     end_time = time.time()
     computation_time = end_time - start_time
     
-    return path, path_length, computation_time
+    return path, final_travel_time, computation_time
 
 
 def enhanced_dijkstra_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Optional[List[int]], float, float]:
     """
-    Enhanced Dijkstra's algorithm that is more sensitive to high congestion values.
+    Enhanced Dijkstra's algorithm using unified travel time calculation system.
+    Finds optimal path considering realistic congestion penalties.
     
     Args:
         G: NetworkX graph with congestion data
@@ -142,6 +188,7 @@ def enhanced_dijkstra_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Opti
         Tuple of (path, travel_time, computation_time)
     """
     start_time = time.time()
+    calc = UnifiedTravelTimeCalculator()
     
     # Initialize data structures
     distances = {node: float('infinity') for node in G.nodes()}
@@ -172,23 +219,27 @@ def enhanced_dijkstra_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Opti
         for neighbor in G.neighbors(current_node):
             if neighbor in visited:
                 continue
-                
-            # Calculate BASE travel time (no congestion)
-            travel_time = get_base_travel_time(G, current_node, neighbor)
-            congestion = G[current_node][neighbor].get('congestion', 1.0)
             
-            # Apply REALISTIC London congestion penalties
-            if congestion > 4.0:
-                penalty = travel_time * 3.5  # Heavy traffic: 71% speed reduction (stop-and-go traffic)
-            elif congestion > 3.0:
-                penalty = travel_time * 2.2  # Moderate traffic: 55% speed reduction (heavy congestion)
-            elif congestion > 2.0:
-                penalty = travel_time * 1.5  # Light traffic: 33% speed reduction (slow traffic)
+            # Use unified travel time calculation with congestion
+            edge_travel_time = 0
+            if current_node in G and neighbor in G[current_node]:
+                edge_keys = list(G[current_node][neighbor].keys())
+                if edge_keys:
+                    k = edge_keys[0]  # Use first edge key
+                    try:
+                        edge_travel_time = calc.calculate_edge_travel_time(
+                            G, current_node, neighbor, k, apply_congestion=True
+                        )
+                    except (KeyError, ValueError):
+                        # Fallback to default time
+                        edge_travel_time = 60.0
+                else:
+                    edge_travel_time = 60.0
             else:
-                penalty = travel_time        # Free flow
+                edge_travel_time = 60.0
             
             # Calculate new distance
-            new_distance = distances[current_node] + penalty
+            new_distance = distances[current_node] + edge_travel_time
             
             # Update if this is a better path
             if new_distance < distances[neighbor]:
@@ -208,46 +259,22 @@ def enhanced_dijkstra_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Opti
         current = previous[current]
     path.reverse()
     
-    # Calculate actual path travel time WITH congestion (the realistic time)
-    path_length = 0
-    for i in range(len(path) - 1):
-        u, v = path[i], path[i+1]
-        base_time = get_edge_travel_time(G, u, v)
-        # Get congestion from first edge key (multigraph support)
-        congestion = 1.0
-        if u in G and v in G[u]:
-            edge_keys = list(G[u][v].keys())
-            if edge_keys:
-                edge_data = G[u][v][edge_keys[0]]
-                if isinstance(edge_data, dict):
-                    congestion = edge_data.get('congestion', 1.0)
-        
-        # Apply the same REALISTIC London congestion penalty used in pathfinding
-        if congestion > 4.0:
-            realistic_time = base_time * 3.5  # Heavy traffic: 71% speed reduction (stop-and-go traffic)
-        elif congestion > 3.0:
-            realistic_time = base_time * 2.2  # Moderate traffic: 55% speed reduction (heavy congestion)
-        elif congestion > 2.0:
-            realistic_time = base_time * 1.5  # Light traffic: 33% speed reduction (slow traffic)
-        else:
-            realistic_time = base_time        # Free flow
-        
-        path_length += realistic_time
+    # Calculate final travel time using unified system
+    final_travel_time = calc.calculate_path_travel_time(G, path, apply_congestion=True)
     
     end_time = time.time()
     computation_time = end_time - start_time
     
-    return path, path_length, computation_time
+    return path, final_travel_time, computation_time
 
 
 def shortest_path_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Optional[List[int]], float, float]:
     """
-    Shortest Path Algorithm - finds the shortest path without considering traffic/congestion.
-    This algorithm finds the shortest possible path from A to B ignoring all traffic conditions.
+    Shortest Path Algorithm using unified travel time calculation system.
+    Finds the shortest path without considering traffic/congestion.
     
     IMPORTANT: This algorithm always returns the SAME result for the same route,
-    regardless of congestion, vehicle counts, or scenarios. It uses original
-    road speeds only, never modified values.
+    regardless of congestion, vehicle counts, or scenarios. It uses base travel times only.
     
     Args:
         G: NetworkX graph
@@ -258,114 +285,30 @@ def shortest_path_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Optional
         Tuple of (path, travel_time, computation_time)
     """
     start_time = time.time()
+    calc = UnifiedTravelTimeCalculator()
     
-    # Get node positions for heuristic
-    pos = {}
-    for node in G.nodes():
-        if 'x' in G.nodes[node] and 'y' in G.nodes[node]:
-            pos[node] = (G.nodes[node]['x'], G.nodes[node]['y'])
-        else:
-            pos[node] = (0, 0)
-    
-    # Define heuristic function (Euclidean distance)
-    def heuristic(n1: int, n2: int) -> float:
-        if n1 in pos and n2 in pos:
-            x1, y1 = pos[n1]
-            x2, y2 = pos[n2]
-            return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
-        else:
-            return 0
-    
-    # Implementation of Simple Shortest Path Search (ignores congestion completely)
-    visited = set()
-    queue = [(heuristic(start, end), start, [start], 0)]
-    heapq.heapify(queue)
-    
-    while queue:
-        _, current, path, cost = heapq.heappop(queue)
+    try:
+        # Use NetworkX shortest path by length (ignoring congestion)
+        path = nx.shortest_path(G, start, end, weight='length')
         
-        if current == end:
-            # Calculate base travel time WITHOUT any congestion effects
-            base_travel_time = 0
-            for i in range(len(path) - 1):
-                u, v = path[i], path[i+1]
-                # Calculate proper base travel time from length/speed
-                edge_data = None
-                if u in G and v in G[u]:
-                    edge_keys = list(G[u][v].keys())
-                    if edge_keys:
-                        edge_data = G[u][v][edge_keys[0]]
-                
-                if isinstance(edge_data, dict):
-                    length = edge_data.get('length', 100)  # meters
-                    # Use ORIGINAL maxspeed, not modified 'speed' field
-                    original_speed = edge_data.get('maxspeed', 50)
-                    
-                    # Handle maxspeed being a list or string
-                    if isinstance(original_speed, (list, tuple)):
-                        original_speed = original_speed[0] if original_speed else 50
-                    elif isinstance(original_speed, str):
-                        try:
-                            original_speed = float(original_speed.split()[0])  # Take first number
-                        except (ValueError, IndexError):
-                            original_speed = 50
-                    
-                    base_time = length / float(original_speed) * 3.6  # Convert to seconds
-                else:
-                    base_time = 60.0  # Default fallback
-                
-                base_travel_time += base_time
-            
-            end_time = time.time()
-            computation_time = end_time - start_time
-            return path, base_travel_time, computation_time
+        # Calculate travel time WITHOUT congestion using unified system
+        final_travel_time = calc.calculate_path_travel_time(G, path, apply_congestion=False)
         
-        if current in visited:
-            continue
-            
-        visited.add(current)
+        end_time = time.time()
+        computation_time = end_time - start_time
         
-        for neighbor in G.neighbors(current):
-            if neighbor not in visited:
-                # Calculate proper base travel time from length/speed (no congestion)
-                edge_data = None
-                if neighbor in G[current]:
-                    edge_keys = list(G[current][neighbor].keys())
-                    if edge_keys:
-                        edge_data = G[current][neighbor][edge_keys[0]]
-                
-                if isinstance(edge_data, dict):
-                    length = edge_data.get('length', 100)  # meters
-                    # Use ORIGINAL maxspeed, not modified 'speed' field
-                    original_speed = edge_data.get('maxspeed', 50)
-                    
-                    # Handle maxspeed being a list or string
-                    if isinstance(original_speed, (list, tuple)):
-                        original_speed = original_speed[0] if original_speed else 50
-                    elif isinstance(original_speed, str):
-                        try:
-                            original_speed = float(original_speed.split()[0])  # Take first number
-                        except (ValueError, IndexError):
-                            original_speed = 50
-                    
-                    base_time = length / float(original_speed) * 3.6  # Convert to seconds
-                else:
-                    base_time = 60.0  # Default fallback
-                
-                # Calculate new cost with base travel time only
-                new_cost = cost + base_time
-                
-                # Priority is purely based on heuristic distance to goal (greedy characteristic)
-                priority = heuristic(neighbor, end)
-                
-                new_path = path + [neighbor]
-                heapq.heappush(queue, (priority, neighbor, new_path, new_cost))
-    
-    # If no path is found
-    end_time = time.time()
-    computation_time = end_time - start_time
-    print(f"No path found from {start} to {end} using Shortest Path algorithm")
-    return None, float('inf'), computation_time
+        return path, final_travel_time, computation_time
+        
+    except nx.NetworkXNoPath:
+        print(f"No path found from {start} to {end} using Shortest Path algorithm")
+        end_time = time.time()
+        computation_time = end_time - start_time
+        return None, float('inf'), computation_time
+    except Exception as e:
+        print(f"Error in shortest path calculation: {e}")
+        end_time = time.time()
+        computation_time = end_time - start_time
+        return None, float('inf'), computation_time
 
 
 def create_congestion_graph(G: nx.Graph, congestion_data: Dict[str, float], time_band: int = 0) -> nx.DiGraph:
@@ -416,8 +359,8 @@ def create_congestion_graph(G: nx.Graph, congestion_data: Dict[str, float], time
 
 def shortest_path_congestion_aware_algorithm(G: nx.Graph, start: int, end: int) -> Tuple[Optional[List[int]], float, float]:
     """
-    Shortest Path Congestion Aware Algorithm - finds the SAME path as shortest path but with congestion-adjusted travel times.
-    This algorithm runs exactly like the shortest path algorithm but returns travel times considering congestion.
+    Shortest Path Congestion Aware Algorithm using unified travel time calculation system.
+    Finds the SAME path as shortest path but with congestion-adjusted travel times.
     
     Args:
         G: NetworkX graph with congestion data
@@ -428,87 +371,30 @@ def shortest_path_congestion_aware_algorithm(G: nx.Graph, start: int, end: int) 
         Tuple of (path, travel_time, computation_time)
     """
     start_time = time.time()
+    calc = UnifiedTravelTimeCalculator()
     
-    # Get node positions for heuristic
-    pos = {}
-    for node in G.nodes():
-        if 'x' in G.nodes[node] and 'y' in G.nodes[node]:
-            pos[node] = (G.nodes[node]['x'], G.nodes[node]['y'])
-        else:
-            pos[node] = (0, 0)
-    
-    # Define heuristic function (Euclidean distance)
-    def heuristic(n1: int, n2: int) -> float:
-        if n1 in pos and n2 in pos:
-            x1, y1 = pos[n1]
-            x2, y2 = pos[n2]
-            return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
-        else:
-            return 0
-    
-    # Implementation of Simple Shortest Path Search (same as shortest path - ignores congestion in pathfinding)
-    visited = set()
-    queue = [(heuristic(start, end), start, [start], 0)]
-    heapq.heapify(queue)
-    
-    while queue:
-        _, current, path, cost = heapq.heappop(queue)
+    try:
+        # Use NetworkX shortest path by length (same as shortest path algorithm)
+        path = nx.shortest_path(G, start, end, weight='length')
         
-        if current == end:
-            # Calculate travel time WITH congestion effects - EXACT SAME METHOD AS A*
-            congestion_travel_time = 0
-            for i in range(len(path) - 1):
-                u, v = path[i], path[i+1]
-                base_time = get_edge_travel_time(G, u, v)
-                # Get congestion from first edge key (multigraph support)
-                congestion = 1.0
-                if u in G and v in G[u]:
-                    edge_keys = list(G[u][v].keys())
-                    if edge_keys:
-                        edge_data = G[u][v][edge_keys[0]]
-                        if isinstance(edge_data, dict):
-                            congestion = edge_data.get('congestion', 1.0)
-                
-                # Apply the same REALISTIC London congestion penalty used in A*
-                if congestion > 4.0:
-                    realistic_time = base_time * 3.5  # Heavy traffic: 71% speed reduction (stop-and-go traffic)
-                elif congestion > 3.0:
-                    realistic_time = base_time * 2.2  # Moderate traffic: 55% speed reduction (heavy congestion)
-                elif congestion > 2.0:
-                    realistic_time = base_time * 1.5  # Light traffic: 33% speed reduction (slow traffic)
-                else:
-                    realistic_time = base_time        # Free flow
-                
-                congestion_travel_time += realistic_time
-            
-            end_time = time.time()
-            computation_time = end_time - start_time
-            return path, congestion_travel_time, computation_time
+        # Calculate travel time WITH congestion using unified system
+        final_travel_time = calc.calculate_path_travel_time(G, path, apply_congestion=True)
         
-        if current in visited:
-            continue
-            
-        visited.add(current)
+        end_time = time.time()
+        computation_time = end_time - start_time
         
-        for neighbor in G.neighbors(current):
-            if neighbor not in visited:
-                # Use get_edge_travel_time for consistency
-                base_time = get_edge_travel_time(G, current, neighbor)
-                
-                # Calculate new cost with base travel time only (same as optimal path)
-                new_cost = cost + base_time
-                
-                # Priority is purely based on heuristic distance to goal (greedy characteristic)
-                priority = heuristic(neighbor, end)
-                
-                new_path = path + [neighbor]
-                heapq.heappush(queue, (priority, neighbor, new_path, new_cost))
-    
-    # If no path is found
-    end_time = time.time()
-    computation_time = end_time - start_time
-    print(f"No path found from {start} to {end} using Shortest Path Congestion Aware algorithm")
-    return None, float('inf'), computation_time
+        return path, final_travel_time, computation_time
+        
+    except nx.NetworkXNoPath:
+        print(f"No path found from {start} to {end} using Shortest Path Congestion Aware algorithm")
+        end_time = time.time()
+        computation_time = end_time - start_time
+        return None, float('inf'), computation_time
+    except Exception as e:
+        print(f"Error in shortest path congestion aware calculation: {e}")
+        end_time = time.time()
+        computation_time = end_time - start_time
+        return None, float('inf'), computation_time
 
 
 def calculate_all_routes(G: nx.Graph, vehicle: Vehicle, congestion_data: Dict[str, float]) -> Vehicle:
