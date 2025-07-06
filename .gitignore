@@ -1,0 +1,18 @@
+# London simulation folder
+london/
+london-simulation/
+*london*/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Jupyter notebooks
+*.ipynb
+
+# Claude Code folder
+.claude/
+
+# macOS
+.DS_Store
